@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"github.com/cihub/seelog"
+	"io"
 	"os"
+	"os/exec"
 	"strings"
+	"time"
 	"webrtc-exmple/config"
 	"webrtc-exmple/entity/srs"
+	"webrtc-exmple/ih264writer"
 	"webrtc-exmple/internal/signal"
 	"webrtc-exmple/utils"
 
@@ -19,8 +24,11 @@ func init() {
 	config.InitLocalLog()
 }
 
-var play_stream = "webrtc://139.159.213.37:10985/live/livestream"
-var srs_api = "http://139.159.213.37:10985/rtc/v1/play/"
+//var play_stream = "webrtc://139.159.213.37:10985/live/livestream"
+//var srs_api = "http://139.159.213.37:10985/rtc/v1/play/"
+
+var play_stream = "webrtc://172.25.24.221:10985/live/livestream"
+var srs_api = "http://172.25.24.221:10985/rtc/v1/play/"
 
 func main() {
 
@@ -88,6 +96,8 @@ func main() {
 		panic(err)
 	}
 
+	h264FileWriter, err := ih264writer.New("F:/data/20230327/ih264Writer.h264")
+
 	// Set a handler for when a new remote track starts, this handler saves buffers to disk as
 	// an ivf file, since we could have multiple video tracks we provide a counter.
 	// In your application this is where you would handle/process video
@@ -97,7 +107,8 @@ func main() {
 			seelog.Infof("Got Opus track, saving to disk as output.opus (48 kHz, 2 channels)")
 		} else if strings.EqualFold(codec.MimeType, webrtc.MimeTypeH264) {
 			seelog.Infof("Got H264 track, saving to disk as output.ivf")
-			recordFrame(track)
+			//recordFrame(track)
+			saveH264ToDisk(h264FileWriter, track)
 		}
 	})
 
@@ -169,17 +180,65 @@ func srsCall(sdp string) string {
 	}
 	return ""
 }
+func saveH264ToDisk(i *ih264writer.H264Writer, track *webrtc.TrackRemote) {
+	defer func() {
+		if err := i.Close(); err != nil {
+			panic(err)
+		}
+	}()
 
-func recordFrame(track *webrtc.TrackRemote) {
-	index := 0
+	//cmd := exec.Command("E:/devtools/ffmpeg/bin/ffmpeg.exe", "-hide_banner", "-loglevel", "error", "-f", "h264", "-i", "pipe:0", "-f", "image2", "F:/data/20230327/std/frame_%3d.jpg")
+	cmd := exec.Command("E:/devtools/ffmpeg/bin/ffmpeg.exe", "-hide_banner", "-loglevel", "error", "-f", "h264", "-i", "pipe:0", "-r", "20", "-q:v", "3", "-f", "image2pipe", "pipe:1")
+
+	cmd.Stderr = os.Stderr        // bind log stream to stderr
+	stdin, err := cmd.StdinPipe() // Open stdin pipe
+	if err != nil {
+		seelog.Errorf("h264 to jpg cmd stdin pipe err:%v", err)
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		seelog.Errorf("h264 to jpg cmd stdout pipe err:%v", err)
+	}
+
+	go cmd.Run()
+
+	go func() {
+		index := 0
+		buffer := bytes.Buffer{}
+		for {
+			bytes := make([]byte, 102400)
+			if length, err := stdout.Read(bytes); err == nil {
+				// todo pipe buffer 2^15=32768
+				//seelog.Infof("read to pipe data index:%d, length:%d", index, length)
+				buffer.Write(bytes[:length])
+				if length < 32768 {
+					seelog.Infof("read to pipe image frame data index:%d, length:%d", index, len(buffer.Bytes()))
+					go os.WriteFile(fmt.Sprintf("F:/data/20230327/std/frame_%03d.jpg", index), buffer.Bytes(), 0644)
+					buffer.Reset()
+					index++
+				}
+			} else if err == io.EOF {
+				seelog.Infof("transfer media data err:%v", err)
+				time.Sleep(time.Duration(20) * time.Millisecond)
+			} else {
+				seelog.Infof("transfer media data err:%v", err)
+				time.Sleep(time.Duration(200) * time.Millisecond)
+			}
+		}
+	}()
+
 	for {
 		rtpPacket, _, err := track.ReadRTP()
 		if err != nil {
 			panic(err)
 		}
-
-		seelog.Infof("receive rtp packet index=%d, Payload length:%v", index, len(rtpPacket.Payload))
-		index++
-
+		if data, err := i.DecodeRTP(rtpPacket); err == nil {
+			if len(data) > 0 {
+				//seelog.Infof("write to pipe media data len:%d", len(data))
+				stdin.Write(data)
+			}
+		}
 	}
+
 }
